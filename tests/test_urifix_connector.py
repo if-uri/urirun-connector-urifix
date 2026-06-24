@@ -159,6 +159,83 @@ def test_diagnose_missing_llm_model() -> None:
     assert result["recovery"][0]["id"] == "use-known-intent"
 
 
+def test_repair_chain_recovers_missing_fs_transfer_routes() -> None:
+    result = {
+        "ok": False,
+        "execute": True,
+        "node": "lenovo",
+        "nodeUrl": "http://192.168.188.201:8765",
+        "uri": "document://host/archive/command/sync-to-node",
+        "destRoot": "~/Downloads/urirun-scans",
+        "preflight": {
+            "missingAfter": [
+                "fs://host/file/command/write-b64",
+                "fs://host/file/query/read-b64",
+            ],
+        },
+        "error": {
+            "type": "ContractError",
+            "message": "remote node is missing required fs transfer route(s): fs://host/file/command/write-b64, fs://host/file/query/read-b64",
+            "uri": "document://host/archive/command/sync-to-node",
+        },
+    }
+
+    repaired = repair_chain(
+        prompt="wyślij dokumenty do lenovo",
+        request={"targets": ["host", "node:lenovo"], "execute": True},
+        result=result,
+    )
+
+    assert repaired["ok"] is True
+    assert repaired["repaired"] is True
+    assert repaired["diagnosis"]["kind"] == "missing-fs-transfer-route"
+    assert repaired["diagnosis"]["missingRoutes"] == [
+        "fs://host/file/command/write-b64",
+        "fs://host/file/query/read-b64",
+    ]
+    assert repaired["retry"] == {
+        "uri": "document://host/archive/command/sync-to-node",
+        "mode": "execute",
+        "payload": {
+            "destRoot": "~/Downloads/urirun-scans",
+            "node": "lenovo",
+            "node_url": "http://192.168.188.201:8765",
+            "ensure_routes": True,
+        },
+    }
+    assert {action["id"] for action in repaired["recovery"]} >= {
+        "retry-document-sync-with-route-preflight",
+        "provision-fs-file-transfer",
+    }
+
+
+def test_repair_chain_maps_legacy_no_sha256_sync_error_to_fs_route_recovery() -> None:
+    result = {
+        "ok": False,
+        "execute": True,
+        "node": "lenovo",
+        "nodeUrl": "http://192.168.188.201:8765",
+        "uri": "document://host/archive/command/sync-to-node",
+        "fsUri": "fs://host/file/command/write-b64",
+        "fsReadUri": "fs://host/file/query/read-b64",
+        "error": {
+            "type": "ContractError",
+            "message": "remote write returned no sha256",
+            "uri": "document://host/archive/command/sync-to-node",
+        },
+    }
+
+    repaired = repair_chain(
+        prompt="wyślij dokumenty do lenovo",
+        request={"targets": ["host", "node:lenovo"], "execute": True},
+        result=result,
+    )
+
+    assert repaired["diagnosis"]["kind"] == "missing-fs-transfer-route"
+    assert repaired["retry"]["payload"]["ensure_routes"] is True
+    assert repaired["retry"]["payload"]["node_url"] == "http://192.168.188.201:8765"
+
+
 def test_runtime_executes_from_compiled_registry() -> None:
     registry = urirun.compile_registry(json.loads(json.dumps(urirun_bindings())))
     env = v2.run(

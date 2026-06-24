@@ -252,6 +252,10 @@ def _nodes_from_request(prompt: str, request: dict, result: dict, alias_map: dic
             clean = str(item).strip()
             if clean and clean not in nodes:
                 nodes.append(clean)
+    for key in ("node", "targetNode"):
+        clean = str(result.get(key) or "").strip()
+        if clean and clean not in nodes:
+            nodes.append(clean)
     for target in _targets_from_request(request, result):
         if target.startswith("node:"):
             node = target.split(":", 1)[1].strip()
@@ -291,6 +295,12 @@ def _error_kind(error: dict) -> str:
         return "missing-node-url"
     if "urirun_llm_model" in message or "llm_model" in message:
         return "missing-llm-model"
+    if (
+        "missing required fs transfer route" in message
+        or "remote write returned no sha256" in message
+        or ("fs.file.command" in message and ("route not found" in message or "not found" in message))
+    ):
+        return "missing-fs-transfer-route"
     if "route not found" in message or error_type == "registry":
         return "missing-route"
     if ("unauthorized" in message or "x-urirun-token" in message or "enrolled-key" in message
@@ -423,6 +433,94 @@ def _missing_route_diagnosis(error: dict) -> dict:
     }
 
 
+def _document_sync_payload(result: dict, node: str, node_url: str) -> dict:
+    error_uri = str(_error(result).get("uri") or "document://host/archive/command/sync-to-node")
+    step = _flow_step(result, error_uri) or _flow_step(result, "document://host/archive/command/sync-to-node")
+    payload = dict(step.get("payload") or {})
+    for key in ("dest_root", "destRoot", "source_root", "sourceRoot"):
+        if result.get(key) is not None and key not in payload:
+            payload[key] = result.get(key)
+    if node:
+        payload.setdefault("node", node)
+    if node_url:
+        payload["node_url"] = node_url
+    payload.setdefault("ensure_routes", True)
+    return payload
+
+
+def _missing_fs_transfer_route_diagnosis(prompt: str, request: dict, result: dict,
+                                         node_urls: dict[str, str], alias_map: dict[str, str]) -> dict:
+    """The document sync reached a node but the node lacks fs file-transfer routes.
+
+    This is recoverable by retrying document sync with route preflight enabled: the host
+    will first try node-side ensure, then push the narrow fs file-transfer shim through
+    /deploy when authorized. urifix does not push code directly; it returns the safe retry.
+    """
+    nodes = _nodes_from_request(prompt, request, result, alias_map)
+    node = nodes[0] if nodes else str(result.get("node") or "").strip()
+    node_url = str(result.get("nodeUrl") or result.get("node_url") or "").strip().rstrip("/")
+    if not node_url and node:
+        node_url = _node_url_for(node, node_urls)
+    sync_uri = str(result.get("uri") or _error(result).get("uri") or "document://host/archive/command/sync-to-node")
+    if not sync_uri.startswith("document://"):
+        sync_uri = "document://host/archive/command/sync-to-node"
+    payload = _document_sync_payload(result, node, node_url)
+    missing = []
+    preflight = result.get("preflight") if isinstance(result.get("preflight"), dict) else {}
+    for item in _as_list(preflight.get("missingAfter") or preflight.get("missingBefore")):
+        missing.append(str(item))
+    if not missing:
+        for key in ("fsUri", "fsReadUri"):
+            if result.get(key):
+                missing.append(str(result[key]))
+    missing = missing or ["fs://host/file/command/write-b64", "fs://host/file/query/read-b64"]
+    retry = {
+        "uri": sync_uri,
+        "mode": "execute" if result.get("execute") or request.get("execute") else "dry-run",
+        "payload": payload,
+    }
+    targets = _targets_from_request(request, result)
+    if node and f"node:{node}" not in targets:
+        targets.append(f"node:{node}")
+    return {
+        "kind": "missing-fs-transfer-route",
+        "summary": "The node is reachable, but it lacks the fs:// file-transfer routes required by document sync.",
+        "node": node,
+        "nodeUrl": node_url,
+        "missingRoutes": missing,
+        "canAutoRetry": bool(node_url),
+        "patch": {
+            "request": {
+                "nodes": [node] if node else [],
+                "targets": targets or ["host"],
+                **({"node_urls": [f"{node}={node_url}"]} if node and node_url else {}),
+            },
+            "stepPayload": payload,
+        },
+        "retry": retry if node_url else None,
+        "actions": [
+            {
+                "id": "retry-document-sync-with-route-preflight",
+                "kind": "retry",
+                "automatic": bool(node_url),
+                "label": "Retry document sync with ensure_routes=true; host will provision fs file-transfer routes before copying.",
+            },
+            {
+                "id": "provision-fs-file-transfer",
+                "kind": "provision",
+                "automatic": bool(node_url),
+                "label": "Ensure fs://host/file/command/write-b64 and fs://host/file/query/read-b64 on the target node.",
+            },
+            *([] if node_url else [{
+                "id": "provide-node-url",
+                "kind": "config",
+                "automatic": False,
+                "label": f"Add node URL for {node or '<node>'} before retrying document sync.",
+            }]),
+        ],
+    }
+
+
 def _missing_auth_diagnosis(error: dict) -> dict:
     """A node refused the call for lack of management auth (X-Urirun-Token / enrolled key).
     Never auto-recoverable: urifix will not supply or fabricate credentials — it surfaces the
@@ -497,6 +595,8 @@ def build_diagnosis(prompt: str = "", request: dict | None = None, result: dict 
         diagnosis = _missing_llm_model_diagnosis()
     elif kind == "missing-route":
         diagnosis = _missing_route_diagnosis(error)
+    elif kind == "missing-fs-transfer-route":
+        diagnosis = _missing_fs_transfer_route_diagnosis(prompt, request, result, url_map, alias_map)
     elif kind == "missing-auth":
         diagnosis = _missing_auth_diagnosis(error)
     else:
