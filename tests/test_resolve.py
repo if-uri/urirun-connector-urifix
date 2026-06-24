@@ -22,7 +22,11 @@ _RESULT = {
 _PROMPT = "wyślij artifacts do lenovo"
 
 
-def test_without_url_only_diagnoses():
+def test_without_url_only_diagnoses(tmp_path, monkeypatch):
+    monkeypatch.setenv("URIRUN_NODES_FILE", str(tmp_path / "missing-nodes.json"))
+    monkeypatch.delenv("URIRUN_NODES", raising=False)
+    monkeypatch.delenv("URIRUN_NODE_ALIASES", raising=False)
+    monkeypatch.delenv("URIRUN_NODE_URL_LENOVO", raising=False)
     d = c.build_diagnosis(_PROMPT, {}, _RESULT)  # no URL anywhere
     assert d["kind"] == "missing-node-url" and d["canAutoRetry"] is False
     assert any(a["id"] == "provide-node-url" for a in d["actions"])
@@ -42,6 +46,7 @@ def test_known_nodes_file_discovery(tmp_path, monkeypatch):
     nodes = tmp_path / "nodes.json"
     nodes.write_text(json.dumps({"lenovo": "http://192.168.188.201:8765"}))
     monkeypatch.setenv("URIRUN_NODES_FILE", str(nodes))
+    monkeypatch.delenv("URIRUN_NODE_URL_LENOVO", raising=False)
     d = c.build_diagnosis(_PROMPT, {}, _RESULT)
     assert d["canAutoRetry"] is True and d["nodeUrl"].endswith(":8765")
 
@@ -50,6 +55,7 @@ def test_nodes_file_list_shape(tmp_path, monkeypatch):
     nodes = tmp_path / "nodes.json"
     nodes.write_text(json.dumps({"nodes": [{"name": "lenovo", "url": "http://192.168.188.201:8765/"}]}))
     monkeypatch.setenv("URIRUN_NODES_FILE", str(nodes))
+    monkeypatch.delenv("URIRUN_NODE_URL_LENOVO", raising=False)
     assert c._known_nodes_file_urls()["lenovo"] == "http://192.168.188.201:8765"
 
 

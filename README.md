@@ -57,6 +57,24 @@ This means `urifix://` is safe to keep deterministic:
 - it can mark a failure as transient and retryable,
 - it must not invent credentials, node addresses or execute side effects.
 
+Node names and aliases are never hardcoded in the connector. `urifix://` reads
+them from the failed request/result/flow, `known_nodes`, `host_config`,
+`URIRUN_NODES`, `URIRUN_NODE_URL_*`, `URIRUN_NODE_ALIASES`, or
+`~/.urirun/nodes.json`.
+
+Example:
+
+```json
+{
+  "known_nodes": {
+    "office-laptop": {
+      "url": "http://192.168.1.20:8766",
+      "aliases": ["notebook", "work laptop"]
+    }
+  }
+}
+```
+
 For the common document-sync case:
 
 ```json

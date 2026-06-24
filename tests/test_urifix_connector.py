@@ -94,7 +94,11 @@ def test_repair_chain_patches_missing_node_url() -> None:
     }
 
 
-def test_repair_chain_requires_node_url_when_unknown() -> None:
+def test_repair_chain_requires_node_url_when_unknown(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("URIRUN_NODES_FILE", str(tmp_path / "missing-nodes.json"))
+    monkeypatch.delenv("URIRUN_NODES", raising=False)
+    monkeypatch.delenv("URIRUN_NODE_ALIASES", raising=False)
+    monkeypatch.delenv("URIRUN_NODE_URL_LENOVO", raising=False)
     result = repair_chain(
         prompt="wyślij dokumenty do lenovo",
         request={"nodes": [], "targets": ["host"], "execute": True},
@@ -106,6 +110,44 @@ def test_repair_chain_requires_node_url_when_unknown() -> None:
     assert result["retry"]["payload"]["node"] == "lenovo"
     assert "node_url" not in result["retry"]["payload"]
     assert result["recovery"][0]["id"] == "provide-node-url"
+
+
+def test_laptop_prompt_hint_does_not_create_second_node_when_concrete_node_exists() -> None:
+    result = repair_chain(
+        prompt="wyślij dokumenty do lenovo laptop",
+        request={"nodes": [], "targets": ["host", "service:phone-scanner"], "execute": True},
+        result=_failed_document_sync_result(),
+    )
+
+    assert result["diagnosis"]["input"]["selectedNodes"] == ["lenovo"]
+    assert result["patch"]["request"]["nodes"] == ["lenovo"]
+
+
+def test_prompt_node_aliases_come_from_known_nodes_not_code() -> None:
+    result_without_node = {
+        **_failed_document_sync_result(),
+        "selectedNodes": [],
+        "selectedTargets": ["host"],
+        "flow": {
+            "steps": [{
+                "id": "sync-documents-to-node",
+                "uri": "document://host/archive/command/sync-to-node",
+                "payload": {"dest_root": "~/Downloads/urirun-scans"},
+            }],
+        },
+    }
+
+    result = repair_chain(
+        prompt="wyślij dokumenty do notebooka",
+        request={"nodes": [], "targets": ["host"], "execute": True},
+        result=result_without_node,
+        known_nodes={"workstation": {"url": "http://node.local:8766", "aliases": ["notebooka"]}},
+    )
+
+    assert result["diagnosis"]["input"]["selectedNodes"] == ["workstation"]
+    assert result["patch"]["request"]["nodes"] == ["workstation"]
+    assert result["retry"]["payload"]["node"] == "workstation"
+    assert result["retry"]["payload"]["node_url"] == "http://node.local:8766"
 
 
 def test_diagnose_missing_llm_model() -> None:
