@@ -1,0 +1,49 @@
+{
+  "id": "urifix",
+  "name": "URI Fix",
+  "status": "available",
+  "category": "Ops",
+  "summary": "Diagnose failed urirun URI chains and return safe repair or retry plans.",
+  "description": "URI Fix is an operational connector for the urirun ecosystem. It reads a failed prompt/flow/result, classifies the failure, and returns a deterministic patch, retry payload, and recovery actions for issues such as missing node URLs, empty node selections, missing LLM model configuration, missing routes/connectors, transient node failures, stale files and invalid payloads. It does not perform privileged provisioning by itself; it emits a safe repair contract that the host/dashboard/node manager can apply.",
+  "useCases": [
+    "Repair failed NL-to-URI chat results.",
+    "Patch missing node_url for document sync and fs copy flows.",
+    "Turn raw URI errors into recovery actions."
+  ],
+  "flowExample": [
+    "urifix://host/chain/query/diagnose",
+    "urifix://host/chain/command/repair"
+  ],
+  "requires": [
+    "python>=3.10"
+  ],
+  "install": {
+    "mode": "urirun-extra",
+    "pipSpec": "urirun-connector-urifix @ git+https://github.com/if-uri/urirun-connector-urifix.git@v0.1.0"
+  },
+  "provenance": "verified",
+  "publisher": {
+    "name": "if-uri",
+    "url": "https://ifuri.com",
+    "github": "https://github.com/if-uri"
+  },
+  "docsUrl": "https://github.com/if-uri/urirun-connector-urifix",
+  "keywords": [
+    "repair",
+    "recovery",
+    "uri",
+    "urirun",
+    "diagnostics",
+    "node"
+  ],
+  "uriSchemes": [
+    "urifix"
+  ],
+  "routes": [
+    "urifix://host/chain/query/diagnose",
+    "urifix://host/chain/command/repair"
+  ],
+  "adapterKinds": [
+    "local-function"
+  ]
+}
