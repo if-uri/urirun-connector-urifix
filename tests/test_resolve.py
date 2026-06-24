@@ -59,6 +59,19 @@ def test_nodes_file_list_shape(tmp_path, monkeypatch):
     assert c._known_nodes_file_urls()["lenovo"] == "http://192.168.188.201:8765"
 
 
+def test_unauthorized_node_install_diagnosed_as_missing_auth():
+    # the exact (c3) wall: installing a connector on a node needs management auth
+    res = {"ok": False, "error": {
+        "type": "PermissionError",
+        "message": "unauthorized (node:// management requires X-Urirun-Token or an enrolled-key signature)",
+        "uri": "node://laptop/connector/command/install"}}
+    d = c.build_diagnosis("zainstaluj fs na lenovo", {}, res)
+    assert d["kind"] == "missing-auth" and d["canAutoRetry"] is False
+    ids = {a["id"] for a in d["actions"]}
+    assert "provide-node-token" in ids and "enroll-key" in ids
+    assert d["node"] == "laptop"
+
+
 def test_repair_plan_only_without_registry():
     r = c.repair_chain(_PROMPT, {}, _RESULT, known_nodes={"lenovo": "http://h:1"}, apply=True)
     # apply requested but no registry -> stays a safe plan, no execution

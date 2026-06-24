@@ -23,18 +23,18 @@ Payload:
 
 ```json
 {
-  "prompt": "wyślij dokumenty do lenovo",
+  "prompt": "wyślij dokumenty do office-node",
   "request": {"nodes": [], "targets": ["host", "service:phone-scanner"]},
   "result": {
     "ok": false,
-    "selectedNodes": ["lenovo"],
+    "selectedNodes": ["office-node"],
     "error": {
       "type": "ValueError",
       "message": "node_url is required when the target node is not present in host config",
       "uri": "document://host/archive/command/sync-to-node"
     }
   },
-  "node_urls": ["lenovo=http://192.168.188.201:8766"]
+  "node_urls": ["office-node=http://node-host:8766"]
 }
 ```
 
@@ -67,9 +67,9 @@ Example:
 ```json
 {
   "known_nodes": {
-    "office-laptop": {
-      "url": "http://192.168.1.20:8766",
-      "aliases": ["notebook", "work laptop"]
+    "office-node": {
+      "url": "http://node-host:8766",
+      "aliases": ["notebook", "workstation"]
     }
   }
 }
@@ -86,8 +86,8 @@ For the common document-sync case:
 }
 ```
 
-with `node_urls=["lenovo=http://192.168.188.201:8766"]`, `repair_chain` returns
-a retry contract for:
+with `node_urls=["office-node=http://node-host:8766"]`, `repair_chain` returns a
+retry contract for:
 
 ```text
 document://host/archive/command/sync-to-node

@@ -293,6 +293,10 @@ def _error_kind(error: dict) -> str:
         return "missing-llm-model"
     if "route not found" in message or error_type == "registry":
         return "missing-route"
+    if ("unauthorized" in message or "x-urirun-token" in message or "enrolled-key" in message
+            or "requires run auth" in message
+            or str(error.get("category") or "") in {"UNAUTHENTICATED", "PERMISSION_DENIED"}):
+        return "missing-auth"
     if "file not found" in message or "no such file" in message:
         return "missing-file"
     if str(error.get("category") or "") in {"UNAVAILABLE", "DEADLINE_EXCEEDED"}:
@@ -419,6 +423,28 @@ def _missing_route_diagnosis(error: dict) -> dict:
     }
 
 
+def _missing_auth_diagnosis(error: dict) -> dict:
+    """A node refused the call for lack of management auth (X-Urirun-Token / enrolled key).
+    Never auto-recoverable: urifix will not supply or fabricate credentials — it surfaces the
+    exact human action instead (a deliberate credential boundary)."""
+    uri = str(error.get("uri") or "")
+    node = uri.split("://", 1)[1].split("/", 1)[0] if "://" in uri else ""
+    return {
+        "kind": "missing-auth",
+        "summary": "The target node requires management auth (X-Urirun-Token or an enrolled key) for this route; urifix cannot supply credentials.",
+        "node": node,
+        "canAutoRetry": False,
+        "patch": {"env": {"URIRUN_TOKEN": "<node management token>"}},
+        "retry": None,
+        "actions": [
+            {"id": "provide-node-token", "kind": "config", "automatic": False,
+             "label": f"Set the node management token (host env URIRUN_TOKEN, or a per-node token) for {node or '<node>'} and retry."},
+            {"id": "enroll-key", "kind": "config", "automatic": False,
+             "label": "Or run from a host whose ed25519 public key is enrolled on the node (signed runs)."},
+        ],
+    }
+
+
 def _generic_diagnosis(kind: str, error: dict) -> dict:
     by_kind = {
         "missing-file": ("A referenced file/artifact is missing.", "mark-stale-artifact"),
@@ -471,6 +497,8 @@ def build_diagnosis(prompt: str = "", request: dict | None = None, result: dict 
         diagnosis = _missing_llm_model_diagnosis()
     elif kind == "missing-route":
         diagnosis = _missing_route_diagnosis(error)
+    elif kind == "missing-auth":
+        diagnosis = _missing_auth_diagnosis(error)
     else:
         diagnosis = _generic_diagnosis(kind, error)
     diagnosis["error"] = error
