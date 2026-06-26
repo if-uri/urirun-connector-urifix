@@ -604,6 +604,11 @@ def _missing_connector_diagnosis(result: dict, error: dict) -> dict:
         scheme = uri.split("://", 1)[0] if "://" in uri else ""
     node = str(result.get("node") or "").strip()
     candidates = _connector_candidates(scheme)
+    known = bool(candidates)
+    # Speculative when scheme not in the static map: the install command is a best-guess
+    # fallback ("urirun-connector-<scheme>") that may not exist.  Mark it so the re-planner
+    # treats it as a hypothesis, not a fact — same honesty as plausibility=0→HITL.
+    speculative = not known
     install_cmd = f"pip install {candidates[0]}" if candidates else (
         f"pip install urirun-connector-{scheme}" if scheme else "pip install <connector-package>"
     )
@@ -617,6 +622,7 @@ def _missing_connector_diagnosis(result: dict, error: dict) -> dict:
         "node": node,
         "candidates": candidates,
         "installCommand": install_cmd,
+        "speculative": speculative,
         "canAutoRetry": False,
         "patch": {},
         "retry": None,
@@ -628,6 +634,7 @@ def _missing_connector_diagnosis(result: dict, error: dict) -> dict:
                 "label": install_cmd,
                 "installCommand": install_cmd,
                 "packages": candidates,
+                **({"speculative": True} if speculative else {}),
             },
             {
                 "id": "retry-after-install",

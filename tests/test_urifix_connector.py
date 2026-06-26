@@ -275,9 +275,11 @@ def test_missing_connector_diagnosis_from_connector_required_error() -> None:
     assert "pip install urirun-connector-camera" in d["installCommand"]
     assert any(a["id"] == "install-connector" for a in d["actions"])
     assert d["canAutoRetry"] is False
+    # Known scheme → NOT speculative.
+    assert d["speculative"] is False
 
 
-def test_missing_connector_diagnosis_unknown_scheme() -> None:
+def test_missing_connector_diagnosis_unknown_scheme_is_speculative() -> None:
     result = {
         "ok": False,
         "error": "connector_required",
@@ -288,8 +290,14 @@ def test_missing_connector_diagnosis_unknown_scheme() -> None:
     d = repair_chain(result=result)["diagnosis"]
     assert d["kind"] == "missing-connector"
     assert d["scheme"] == "ssh"
-    # ssh has no public package → install command still sensible
     assert "ssh" in d["installCommand"]
+    # Unknown scheme → speculative:true so the re-planner knows this is a best-guess,
+    # not a verified package name.
+    assert d["speculative"] is True
+    assert d["candidates"] == []
+    # The install action itself is also marked speculative.
+    install_action = next(a for a in d["actions"] if a["id"] == "install-connector")
+    assert install_action.get("speculative") is True
 
 
 def test_stopped_service_diagnosis() -> None:
