@@ -48,18 +48,25 @@ def _error(result: dict) -> dict:
     return {}
 
 
+_PRECONDITION_MSGS = ("node_url is required", "urirun_llm_model", "llm_model")
+
+
+def _classify_category(out: dict) -> str:
+    msg = str(out.get("message") or "").casefold()
+    if any(p in msg for p in _PRECONDITION_MSGS):
+        return "FAILED_PRECONDITION"
+    return uri_errors.classify(str(out.get("type") or ""), str(out.get("message") or ""))
+
+
 def _normalize_error(error: dict) -> dict:
     out = dict(error or {})
     out.setdefault("type", "Error")
     out.setdefault("message", "")
     uri = str(out.get("uri") or "")
     if not out.get("category"):
-        message = str(out.get("message") or "").casefold()
-        if "node_url is required" in message or "urirun_llm_model" in message or "llm_model" in message:
-            out["category"] = "FAILED_PRECONDITION"
-        else:
-            out["category"] = uri_errors.classify(str(out.get("type") or ""), str(out.get("message") or ""))
-    out.setdefault("code", uri_errors.error_code(str(out.get("type") or ""), str(out.get("message") or ""), uri.split("://", 1)[0] if "://" in uri else ""))
+        out["category"] = _classify_category(out)
+    scheme = uri.split("://", 1)[0] if "://" in uri else ""
+    out.setdefault("code", uri_errors.error_code(str(out.get("type") or ""), str(out.get("message") or ""), scheme))
     status, severity, _ = uri_errors.category_meta(str(out.get("category") or "UNKNOWN"))
     out.setdefault("status", status)
     out.setdefault("severity", severity)
@@ -245,38 +252,56 @@ def _targets_from_request(request: dict, result: dict) -> list[str]:
     return targets
 
 
-def _nodes_from_request(prompt: str, request: dict, result: dict, alias_map: dict[str, str] | None = None) -> list[str]:
+def _append_unique(lst: list[str], item: str) -> None:
+    clean = str(item).strip()
+    if clean and clean not in lst:
+        lst.append(clean)
+
+
+def _nodes_from_structured(request: dict, result: dict) -> list[str]:
     nodes: list[str] = []
     for source in (_as_list(request.get("nodes")), _as_list(result.get("selectedNodes"))):
         for item in source:
-            clean = str(item).strip()
-            if clean and clean not in nodes:
-                nodes.append(clean)
+            _append_unique(nodes, item)
     for key in ("node", "targetNode"):
-        clean = str(result.get(key) or "").strip()
-        if clean and clean not in nodes:
-            nodes.append(clean)
+        _append_unique(nodes, str(result.get(key) or ""))
     for target in _targets_from_request(request, result):
         if target.startswith("node:"):
-            node = target.split(":", 1)[1].strip()
-            if node and node not in nodes:
-                nodes.append(node)
-    flow = _as_dict(result.get("flow"))
-    for step in _as_list(flow.get("steps")):
+            _append_unique(nodes, target.split(":", 1)[1])
+    return nodes
+
+
+def _nodes_from_flow(result: dict) -> list[str]:
+    nodes: list[str] = []
+    for step in _as_list(_as_dict(result.get("flow")).get("steps")):
         if not isinstance(step, dict):
             continue
         payload = _as_dict(step.get("payload"))
         for key in ("node", "targetNode"):
-            node = str(payload.get(key) or "").strip()
-            if node and node not in nodes:
-                nodes.append(node)
-    alias_map = alias_map or {}
+            _append_unique(nodes, str(payload.get(key) or ""))
+    return nodes
+
+
+def _nodes_from_aliases(prompt: str, alias_map: dict[str, str]) -> list[str]:
+    nodes: list[str] = []
     lowered = prompt.casefold()
     for alias, node in sorted(alias_map.items(), key=lambda item: len(item[0]), reverse=True):
         if not alias or node in nodes:
             continue
         if re.search(rf"(?<![\w.-]){re.escape(alias)}(?![\w.-])", lowered):
             nodes.append(node)
+    return nodes
+
+
+def _nodes_from_request(prompt: str, request: dict, result: dict, alias_map: dict[str, str] | None = None) -> list[str]:
+    nodes = _nodes_from_structured(request, result)
+    for node in _nodes_from_flow(result):
+        _append_unique(nodes, node)
+    # Alias-map inference only runs when no concrete nodes came from structured sources.
+    # If the result or request already named specific nodes, trust them — don't guess more
+    # from prompt keywords that may be generic words (e.g. "laptop" in "lenovo laptop").
+    if not nodes:
+        nodes.extend(_nodes_from_aliases(prompt, alias_map or {}))
     return nodes
 
 
@@ -333,40 +358,46 @@ def _connector_candidates(scheme: str) -> list[str]:
     return list(_SCHEME_CONNECTORS.get(scheme.casefold(), []))
 
 
+# Ordered list of (message substrings, kind) — first match wins.
+_MSG_KIND: list[tuple[tuple[str, ...], str]] = [
+    (("node_url is required",), "missing-node-url"),
+    (("urirun_llm_model", "llm_model"), "missing-llm-model"),
+    (("connector_required", "needs a dedicated connector"), "missing-connector"),
+    (("route not found",), "missing-route"),
+    (("unauthorized", "x-urirun-token", "enrolled-key", "requires run auth"), "missing-auth"),
+    (("address already in use", "port is already in use", "errno 98"), "busy-port"),
+    (("connection refused", "[errno 111]", "service not running"), "stopped-service"),
+    (("verification failed", "verification contract"), "failed-verification"),
+    (("file not found", "no such file"), "missing-file"),
+]
+
+_CATEGORY_KIND: dict[str, str] = {
+    "UNAUTHENTICATED": "missing-auth", "PERMISSION_DENIED": "missing-auth",
+    "UNAVAILABLE": "transient-target", "DEADLINE_EXCEEDED": "transient-target",
+    "INVALID_ARGUMENT": "invalid-payload",
+}
+
+
+def _is_fs_transfer_failure(msg: str) -> bool:
+    return ("missing required fs transfer route" in msg
+            or "remote write returned no sha256" in msg
+            or ("fs.file.command" in msg and "not found" in msg))
+
+
 def _error_kind(error: dict) -> str:
-    message = str(error.get("message") or "").casefold()
+    msg = str(error.get("message") or "").casefold()
     error_type = str(error.get("type") or "").casefold()
-    if "node_url is required" in message:
-        return "missing-node-url"
-    if "urirun_llm_model" in message or "llm_model" in message:
-        return "missing-llm-model"
-    if (
-        "missing required fs transfer route" in message
-        or "remote write returned no sha256" in message
-        or ("fs.file.command" in message and ("route not found" in message or "not found" in message))
-    ):
+    category = str(error.get("category") or "")
+    if _is_fs_transfer_failure(msg):
         return "missing-fs-transfer-route"
-    if "connector_required" in message or "needs a dedicated connector" in message:
-        return "missing-connector"
-    if "route not found" in message or error_type == "registry":
-        return "missing-route"
-    if ("unauthorized" in message or "x-urirun-token" in message or "enrolled-key" in message
-            or "requires run auth" in message
-            or str(error.get("category") or "") in {"UNAUTHENTICATED", "PERMISSION_DENIED"}):
+    for patterns, kind in _MSG_KIND:
+        if any(p in msg for p in patterns):
+            return kind
+    if category in {"UNAUTHENTICATED", "PERMISSION_DENIED"}:
         return "missing-auth"
-    if "address already in use" in message or "port is already in use" in message or "errno 98" in message:
-        return "busy-port"
-    if "connection refused" in message or "[errno 111]" in message or "service not running" in message:
-        return "stopped-service"
-    if "verification failed" in message or "verification contract" in message:
-        return "failed-verification"
-    if "file not found" in message or "no such file" in message:
-        return "missing-file"
-    if str(error.get("category") or "") in {"UNAVAILABLE", "DEADLINE_EXCEEDED"}:
-        return "transient-target"
-    if str(error.get("category") or "") in {"INVALID_ARGUMENT"}:
-        return "invalid-payload"
-    return "unknown"
+    if error_type == "registry":
+        return "missing-route"
+    return _CATEGORY_KIND.get(category, "unknown")
 
 
 def _node_url_for(node: str, node_urls: dict[str, str]) -> str:
@@ -377,6 +408,30 @@ def _node_url_for(node: str, node_urls: dict[str, str]) -> str:
         if name.casefold() == lowered:
             return url
     return ""
+
+
+def _node_url_retry(error_uri: str, step_payload: dict, execute: bool) -> dict | None:
+    if not error_uri:
+        return None
+    return {
+        "uri": error_uri,
+        "mode": "execute" if execute else "dry-run",
+        "payload": step_payload,
+    }
+
+
+def _node_url_actions(node: str, url: str, error_uri: str, retry: dict | None) -> list[dict]:
+    actions: list[dict] = []
+    if url and retry:
+        actions.append({"id": "retry-with-node-url", "kind": "retry", "automatic": True,
+                        "label": f"Retry {error_uri} with node_url={url}."})
+    if not url:
+        placeholder = node or "<node>"
+        actions.append({"id": "provide-node-url", "kind": "config", "automatic": False,
+                        "label": f"Add node URL for {placeholder}: pass node_urls=['{placeholder}=http://HOST:PORT'] or add it to host config."})
+    actions.append({"id": "ensure-node-target", "kind": "payload", "automatic": True,
+                    "label": "Keep targets and nodes consistent: node:<name> implies nodes=[<name>]."})
+    return actions
 
 
 def _missing_node_url_diagnosis(prompt: str, request: dict, result: dict, node_urls: dict[str, str],
@@ -394,48 +449,20 @@ def _missing_node_url_diagnosis(prompt: str, request: dict, result: dict, node_u
         step_payload.setdefault("node", node)
     if url:
         step_payload["node_url"] = url
-    retry = None
-    if error_uri:
-        retry = {
-            "uri": error_uri,
-            "mode": "execute" if result.get("execute") or request.get("execute") else "dry-run",
-            "payload": step_payload,
-        }
+    execute = bool(result.get("execute") or request.get("execute"))
+    retry = _node_url_retry(error_uri, step_payload, execute)
+    patch_request: dict = {"nodes": [node] if node else [], "targets": targets or ["host"]}
+    if node and url:
+        patch_request["node_urls"] = [f"{node}={url}"]
     return {
         "kind": "missing-node-url",
         "summary": "The flow selected a node name but the host cannot resolve it to a node URL.",
         "node": node,
         "nodeUrl": url,
         "canAutoRetry": bool(url and retry),
-        "patch": {
-            "request": {
-                "nodes": [node] if node else [],
-                "targets": targets or ["host"],
-                **({"node_urls": [f"{node}={url}"]} if node and url else {}),
-            },
-            "stepPayload": step_payload,
-        },
+        "patch": {"request": patch_request, "stepPayload": step_payload},
         "retry": retry,
-        "actions": [
-            *([{
-                "id": "retry-with-node-url",
-                "kind": "retry",
-                "automatic": True,
-                "label": f"Retry {error_uri} with node_url={url}.",
-            }] if url and retry else []),
-            *([] if url else [{
-                "id": "provide-node-url",
-                "kind": "config",
-                "automatic": False,
-                "label": f"Add node URL for {node or '<node>'}: pass node_urls=['{node or '<node>'}=http://HOST:PORT'] or add it to host config.",
-            }]),
-            {
-                "id": "ensure-node-target",
-                "kind": "payload",
-                "automatic": True,
-                "label": "Keep targets and nodes consistent: node:<name> implies nodes=[<name>].",
-            },
-        ],
+        "actions": _node_url_actions(node, url, error_uri, retry),
     }
 
 
@@ -501,13 +528,41 @@ def _document_sync_payload(result: dict, node: str, node_url: str) -> dict:
     return payload
 
 
+def _fs_missing_routes(result: dict) -> list[str]:
+    preflight = result.get("preflight") if isinstance(result.get("preflight"), dict) else {}
+    missing = [str(item) for item in _as_list(preflight.get("missingAfter") or preflight.get("missingBefore"))]
+    if not missing:
+        missing = [str(result[k]) for k in ("fsUri", "fsReadUri") if result.get(k)]
+    return missing or ["fs://host/file/command/write-b64", "fs://host/file/query/read-b64"]
+
+
+def _fs_patch_request(node: str, node_url: str, targets: list[str]) -> dict:
+    patch: dict = {"nodes": [node] if node else [], "targets": targets or ["host"]}
+    if node and node_url:
+        patch["node_urls"] = [f"{node}={node_url}"]
+    return patch
+
+
+def _fs_actions(node_url: str, node: str) -> list[dict]:
+    auto = bool(node_url)
+    actions = [
+        {"id": "retry-document-sync-with-route-preflight", "kind": "retry", "automatic": auto,
+         "label": "Retry document sync with ensure_routes=true; host will provision fs file-transfer routes before copying."},
+        {"id": "provision-fs-file-transfer", "kind": "provision", "automatic": auto,
+         "label": "Ensure fs://host/file/command/write-b64 and fs://host/file/query/read-b64 on the target node."},
+    ]
+    if not node_url:
+        actions.append({"id": "provide-node-url", "kind": "config", "automatic": False,
+                        "label": f"Add node URL for {node or '<node>'} before retrying document sync."})
+    return actions
+
+
 def _missing_fs_transfer_route_diagnosis(prompt: str, request: dict, result: dict,
                                          node_urls: dict[str, str], alias_map: dict[str, str]) -> dict:
     """The document sync reached a node but the node lacks fs file-transfer routes.
 
-    This is recoverable by retrying document sync with route preflight enabled: the host
-    will first try node-side ensure, then push the narrow fs file-transfer shim through
-    /deploy when authorized. urifix does not push code directly; it returns the safe retry.
+    Recoverable by retrying with route preflight enabled: the host will provision the
+    narrow fs file-transfer shim via /deploy.  urifix returns the safe retry only.
     """
     nodes = _nodes_from_request(prompt, request, result, alias_map)
     node = nodes[0] if nodes else str(result.get("node") or "").strip()
@@ -518,20 +573,9 @@ def _missing_fs_transfer_route_diagnosis(prompt: str, request: dict, result: dic
     if not sync_uri.startswith("document://"):
         sync_uri = "document://host/archive/command/sync-to-node"
     payload = _document_sync_payload(result, node, node_url)
-    missing = []
-    preflight = result.get("preflight") if isinstance(result.get("preflight"), dict) else {}
-    for item in _as_list(preflight.get("missingAfter") or preflight.get("missingBefore")):
-        missing.append(str(item))
-    if not missing:
-        for key in ("fsUri", "fsReadUri"):
-            if result.get(key):
-                missing.append(str(result[key]))
-    missing = missing or ["fs://host/file/command/write-b64", "fs://host/file/query/read-b64"]
-    retry = {
-        "uri": sync_uri,
-        "mode": "execute" if result.get("execute") or request.get("execute") else "dry-run",
-        "payload": payload,
-    }
+    missing = _fs_missing_routes(result)
+    execute = bool(result.get("execute") or request.get("execute"))
+    retry: dict | None = {"uri": sync_uri, "mode": "execute" if execute else "dry-run", "payload": payload}
     targets = _targets_from_request(request, result)
     if node and f"node:{node}" not in targets:
         targets.append(f"node:{node}")
@@ -542,35 +586,9 @@ def _missing_fs_transfer_route_diagnosis(prompt: str, request: dict, result: dic
         "nodeUrl": node_url,
         "missingRoutes": missing,
         "canAutoRetry": bool(node_url),
-        "patch": {
-            "request": {
-                "nodes": [node] if node else [],
-                "targets": targets or ["host"],
-                **({"node_urls": [f"{node}={node_url}"]} if node and node_url else {}),
-            },
-            "stepPayload": payload,
-        },
+        "patch": {"request": _fs_patch_request(node, node_url, targets), "stepPayload": payload},
         "retry": retry if node_url else None,
-        "actions": [
-            {
-                "id": "retry-document-sync-with-route-preflight",
-                "kind": "retry",
-                "automatic": bool(node_url),
-                "label": "Retry document sync with ensure_routes=true; host will provision fs file-transfer routes before copying.",
-            },
-            {
-                "id": "provision-fs-file-transfer",
-                "kind": "provision",
-                "automatic": bool(node_url),
-                "label": "Ensure fs://host/file/command/write-b64 and fs://host/file/query/read-b64 on the target node.",
-            },
-            *([] if node_url else [{
-                "id": "provide-node-url",
-                "kind": "config",
-                "automatic": False,
-                "label": f"Add node URL for {node or '<node>'} before retrying document sync.",
-            }]),
-        ],
+        "actions": _fs_actions(node_url, node),
     }
 
 
