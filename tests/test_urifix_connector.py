@@ -257,6 +257,115 @@ def test_runtime_executes_from_compiled_registry() -> None:
     assert data["retry"]["payload"]["node_url"] == "http://192.168.188.201:8766"
 
 
+def test_missing_connector_diagnosis_from_connector_required_error() -> None:
+    result = {
+        "ok": False,
+        "error": "connector_required",
+        "message": "camera:// execution needs a dedicated connector; configured API metadata is available",
+        "scheme": "camera",
+        "node": "lenovo",
+        "api": {"url": "http://192.168.188.201:8765"},
+    }
+    repaired = repair_chain(prompt="pokaż co widzi kamera w lenovo", result=result)
+    d = repaired["diagnosis"]
+    assert d["kind"] == "missing-connector"
+    assert d["scheme"] == "camera"
+    assert d["node"] == "lenovo"
+    assert "urirun-connector-camera" in d["candidates"]
+    assert "pip install urirun-connector-camera" in d["installCommand"]
+    assert any(a["id"] == "install-connector" for a in d["actions"])
+    assert d["canAutoRetry"] is False
+
+
+def test_missing_connector_diagnosis_unknown_scheme() -> None:
+    result = {
+        "ok": False,
+        "error": "connector_required",
+        "message": "ssh:// execution needs a dedicated connector",
+        "scheme": "ssh",
+        "node": "server",
+    }
+    d = repair_chain(result=result)["diagnosis"]
+    assert d["kind"] == "missing-connector"
+    assert d["scheme"] == "ssh"
+    # ssh has no public package → install command still sensible
+    assert "ssh" in d["installCommand"]
+
+
+def test_stopped_service_diagnosis() -> None:
+    result = {
+        "ok": False,
+        "error": {
+            "type": "ConnectionError",
+            "message": "connection refused [Errno 111] connecting to 192.168.188.201:8765",
+            "uri": "kvm://laptop/ui/query/find",
+        },
+    }
+    d = repair_chain(result=result)["diagnosis"]
+    assert d["kind"] == "stopped-service"
+    assert d["canAutoRetry"] is False
+    assert any(a["id"] == "start-service" for a in d["actions"])
+    assert any(a["id"] == "check-health" for a in d["actions"])
+
+
+def test_busy_port_diagnosis() -> None:
+    result = {
+        "ok": False,
+        "error": {
+            "type": "OSError",
+            "message": "OSError: [Errno 98] address already in use :8765",
+            "uri": "dashboard://host/service/scanner/command/start",
+        },
+    }
+    d = repair_chain(result=result)["diagnosis"]
+    assert d["kind"] == "busy-port"
+    assert d["port"] == "8765"
+    assert d["canAutoRetry"] is False
+    assert any(a["id"] == "identify-port-owner" for a in d["actions"])
+
+
+def test_failed_verification_diagnosis_from_result_block() -> None:
+    result = {
+        "ok": False,
+        "verification": {
+            "ok": False,
+            "expected": 3,
+            "actual": 1,
+            "checks": [
+                {"check": "files-transferred", "ok": False},
+                {"check": "sha256-match", "ok": True},
+            ],
+        },
+        "error": {"type": "Error", "message": "some other error"},
+    }
+    d = repair_chain(result=result)["diagnosis"]
+    assert d["kind"] == "failed-verification"
+    assert "files-transferred" in d["failedChecks"]
+    assert d["expected"] == 3
+    assert d["actual"] == 1
+    assert d["canAutoRetry"] is False
+    assert any(a["id"] == "inspect-verification" for a in d["actions"])
+
+
+def test_failed_verification_diagnosis_from_error_message() -> None:
+    result = {
+        "ok": False,
+        "error": {
+            "type": "ContractError",
+            "message": "verification failed: expected 3 transferred, got 0",
+        },
+    }
+    d = repair_chain(result=result)["diagnosis"]
+    assert d["kind"] == "failed-verification"
+
+
+def test_connector_candidates_static_map() -> None:
+    from urirun_connector_urifix.core import _connector_candidates
+    assert "urirun-connector-fs" in _connector_candidates("fs")
+    assert "urirun-connector-kvm" in _connector_candidates("kvm")
+    assert _connector_candidates("nonexistent-scheme-xyz") == []
+
+
 def test_manifest_and_cli(capsys) -> None:
     manifest = connector_manifest()
     assert manifest["id"] == "urifix"

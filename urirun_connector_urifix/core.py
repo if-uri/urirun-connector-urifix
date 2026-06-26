@@ -288,6 +288,51 @@ def _flow_step(result: dict, uri: str) -> dict:
     return {}
 
 
+# Static scheme → connector package map.  Authoritative for install hints; connectors not yet
+# published as standalone packages are omitted (they live in urirun core or are unreleased).
+_SCHEME_CONNECTORS: dict[str, list[str]] = {
+    "adb": ["urirun-connector-adb"],
+    "adopt": ["urirun-connector-adopt"],
+    "base64": ["urirun-connector-base64"],
+    "browser": ["urirun-connector-browser-control"],
+    "cdp": ["urirun-connector-browser-control"],
+    "camera": ["urirun-connector-camera", "urirun-connector-camera-web"],
+    "webcam": ["urirun-connector-camera-web"],
+    "doc": ["urirun-connector-doc"],
+    "docid": ["urirun-connector-docid"],
+    "domain": ["urirun-connector-domain-monitor"],
+    "email": ["urirun-connector-email"],
+    "flow": ["urirun-flow"],
+    "fs": ["urirun-connector-fs"],
+    "get": ["urirun-connector-get-node"],
+    "github": ["urirun-connector-github"],
+    "hash": ["urirun-connector-hash"],
+    "http-check": ["urirun-connector-http-check"],
+    "invoice": ["urirun-connector-invoice"],
+    "ksef": ["urirun-connector-ksef"],
+    "kvm": ["urirun-connector-kvm"],
+    "linkedin": ["urirun-connector-linkedin"],
+    "llm": ["urirun-connector-llm"],
+    "mcp-fs": ["urirun-connector-mcp-filesystem"],
+    "mqtt": ["urirun-connector-mqtt"],
+    "namecheap": ["urirun-connector-namecheap-dns"],
+    "netscan": ["urirun-connector-netscan"],
+    "ocr": ["urirun-connector-ocr"],
+    "planfile": ["urirun-connector-planfile"],
+    "sheet": ["urirun-connector-sheet"],
+    "smartcrop": ["urirun-connector-smart-crop"],
+    "sqlite": ["urirun-connector-sqlite-context"],
+    "time": ["urirun-connector-time-tools"],
+    "usb": ["urirun-connector-usb"],
+    "uuid": ["urirun-connector-uuid"],
+    "webnode": ["urirun-connector-webnode"],
+}
+
+
+def _connector_candidates(scheme: str) -> list[str]:
+    return list(_SCHEME_CONNECTORS.get(scheme.casefold(), []))
+
+
 def _error_kind(error: dict) -> str:
     message = str(error.get("message") or "").casefold()
     error_type = str(error.get("type") or "").casefold()
@@ -301,12 +346,20 @@ def _error_kind(error: dict) -> str:
         or ("fs.file.command" in message and ("route not found" in message or "not found" in message))
     ):
         return "missing-fs-transfer-route"
+    if "connector_required" in message or "needs a dedicated connector" in message:
+        return "missing-connector"
     if "route not found" in message or error_type == "registry":
         return "missing-route"
     if ("unauthorized" in message or "x-urirun-token" in message or "enrolled-key" in message
             or "requires run auth" in message
             or str(error.get("category") or "") in {"UNAUTHENTICATED", "PERMISSION_DENIED"}):
         return "missing-auth"
+    if "address already in use" in message or "port is already in use" in message or "errno 98" in message:
+        return "busy-port"
+    if "connection refused" in message or "[errno 111]" in message or "service not running" in message:
+        return "stopped-service"
+    if "verification failed" in message or "verification contract" in message:
+        return "failed-verification"
     if "file not found" in message or "no such file" in message:
         return "missing-file"
     if str(error.get("category") or "") in {"UNAVAILABLE", "DEADLINE_EXCEEDED"}:
@@ -543,6 +596,151 @@ def _missing_auth_diagnosis(error: dict) -> dict:
     }
 
 
+def _missing_connector_diagnosis(result: dict, error: dict) -> dict:
+    scheme = str(result.get("scheme") or "").strip()
+    if not scheme:
+        # Fallback: parse from error URI or message.
+        uri = str(error.get("uri") or result.get("uri") or "")
+        scheme = uri.split("://", 1)[0] if "://" in uri else ""
+    node = str(result.get("node") or "").strip()
+    candidates = _connector_candidates(scheme)
+    install_cmd = f"pip install {candidates[0]}" if candidates else (
+        f"pip install urirun-connector-{scheme}" if scheme else "pip install <connector-package>"
+    )
+    return {
+        "kind": "missing-connector",
+        "summary": (
+            f"{scheme}:// requires a dedicated connector that is not installed."
+            if scheme else "A required connector is not installed."
+        ),
+        "scheme": scheme,
+        "node": node,
+        "candidates": candidates,
+        "installCommand": install_cmd,
+        "canAutoRetry": False,
+        "patch": {},
+        "retry": None,
+        "actions": [
+            {
+                "id": "install-connector",
+                "kind": "provision",
+                "automatic": False,
+                "label": install_cmd,
+                "installCommand": install_cmd,
+                "packages": candidates,
+            },
+            {
+                "id": "retry-after-install",
+                "kind": "retry",
+                "automatic": False,
+                "label": (
+                    f"After installing, retry the original {scheme}:// call."
+                    if scheme else "After installing the connector, retry the original call."
+                ),
+            },
+        ],
+    }
+
+
+def _stopped_service_diagnosis(error: dict) -> dict:
+    uri = str(error.get("uri") or "")
+    scheme = uri.split("://", 1)[0] if "://" in uri else ""
+    host_part = uri.split("://", 1)[1].split("/", 1)[0] if "://" in uri else ""
+    return {
+        "kind": "stopped-service",
+        "summary": "The target service or node is not running (connection refused).",
+        "scheme": scheme,
+        "host": host_part,
+        "canAutoRetry": False,
+        "patch": {},
+        "retry": None,
+        "actions": [
+            {
+                "id": "start-service",
+                "kind": "lifecycle",
+                "automatic": False,
+                "label": (
+                    f"Start or restart the service at {host_part} and retry."
+                    if host_part else "Start the required service and retry."
+                ),
+            },
+            {
+                "id": "check-health",
+                "kind": "diagnostic",
+                "automatic": False,
+                "label": "Run health check on the target node to confirm it is reachable.",
+            },
+        ],
+    }
+
+
+def _busy_port_diagnosis(error: dict) -> dict:
+    message = str(error.get("message") or "")
+    port = ""
+    import re as _re
+    m = _re.search(r":(\d{2,5})", message)
+    if m:
+        port = m.group(1)
+    return {
+        "kind": "busy-port",
+        "summary": "A port required by a service is already in use.",
+        "port": port,
+        "canAutoRetry": False,
+        "patch": {},
+        "retry": None,
+        "actions": [
+            {
+                "id": "identify-port-owner",
+                "kind": "diagnostic",
+                "automatic": False,
+                "label": f"Identify what is using port {port} (e.g. lsof -i :{port}) and stop it, or reconfigure the service to use a different port." if port else "Identify the process holding the port and stop it, or reconfigure the service.",
+            },
+            {
+                "id": "port-replace",
+                "kind": "lifecycle",
+                "automatic": False,
+                "label": "Use port-replace mode to restart the service on the same port after clearing the occupant.",
+            },
+        ],
+    }
+
+
+def _failed_verification_diagnosis(result: dict, error: dict) -> dict:
+    verification = result.get("verification") if isinstance(result.get("verification"), dict) else {}
+    checks = [c for c in (verification.get("checks") or []) if isinstance(c, dict) and not c.get("ok")]
+    failed_names = [str(c.get("check") or c.get("name") or "?") for c in checks]
+    expected = verification.get("expected")
+    actual = verification.get("actual")
+    return {
+        "kind": "failed-verification",
+        "summary": "The operation completed but the post-execution verification contract failed.",
+        "failedChecks": failed_names,
+        "expected": expected,
+        "actual": actual,
+        "canAutoRetry": False,
+        "patch": {},
+        "retry": None,
+        "actions": [
+            {
+                "id": "inspect-verification",
+                "kind": "diagnostic",
+                "automatic": False,
+                "label": (
+                    f"Inspect failed checks: {', '.join(failed_names)}."
+                    if failed_names else "Inspect the verification block for mismatched expected/actual counts."
+                ),
+            },
+            {
+                "id": "manual-verify",
+                "kind": "diagnostic",
+                "automatic": False,
+                "label": "Manually verify the side-effecting operation succeeded and re-run or rollback as appropriate.",
+            },
+        ],
+        "verification": verification,
+    }
+
+
 def _generic_diagnosis(kind: str, error: dict) -> dict:
     by_kind = {
         "missing-file": ("A referenced file/artifact is missing.", "mark-stale-artifact"),
@@ -588,7 +786,12 @@ def build_diagnosis(prompt: str = "", request: dict | None = None, result: dict 
         **_node_alias_map_from_value(known_nodes),
         **_node_alias_map_from_value(node_urls),
     }
-    kind = _error_kind(error)
+    # failed-verification is detected from the result structure, not just the error message.
+    verification = result.get("verification") if isinstance(result.get("verification"), dict) else {}
+    if not result.get("ok") and verification and not verification.get("ok"):
+        kind = "failed-verification"
+    else:
+        kind = _error_kind(error)
     if kind == "missing-node-url":
         diagnosis = _missing_node_url_diagnosis(prompt, request, result, url_map, alias_map)
     elif kind == "missing-llm-model":
@@ -599,6 +802,14 @@ def build_diagnosis(prompt: str = "", request: dict | None = None, result: dict 
         diagnosis = _missing_fs_transfer_route_diagnosis(prompt, request, result, url_map, alias_map)
     elif kind == "missing-auth":
         diagnosis = _missing_auth_diagnosis(error)
+    elif kind == "missing-connector":
+        diagnosis = _missing_connector_diagnosis(result, error)
+    elif kind == "stopped-service":
+        diagnosis = _stopped_service_diagnosis(error)
+    elif kind == "busy-port":
+        diagnosis = _busy_port_diagnosis(error)
+    elif kind == "failed-verification":
+        diagnosis = _failed_verification_diagnosis(result, error)
     else:
         diagnosis = _generic_diagnosis(kind, error)
     diagnosis["error"] = error
