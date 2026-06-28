@@ -1,0 +1,39 @@
+{
+  "contracts": {
+    "chain/query/diagnose": {
+      "version": "v1",
+      "effect": "query",
+      "reversible": false,
+      "inp": { "prompt": "?str", "request": "?obj", "result": "?obj", "node_urls": "?any", "host_config": "?obj" },
+      "out": { "diagnosis": "obj", "recovery": "list" },
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [
+        {
+          "payload": { "prompt": "why did the chain fail?" },
+          "result": { "ok": true, "diagnosis": {}, "recovery": [] }
+        }
+      ]
+    },
+    "chain/command/repair": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": false,
+      "inp": { "prompt": "?str", "request": "?obj", "result": "?obj", "node_urls": "?any", "host_config": "?obj", "apply": "?bool" },
+      "out": {
+        "repaired": "bool", "applied": "bool", "applyRequested": "bool",
+        "diagnosis": "obj", "patch": "obj", "retry": "?obj", "runResult": "obj", "recovery": "list"
+      },
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [
+        {
+          "payload": { "prompt": "fix the chain", "apply": false },
+          "result": {
+            "ok": true, "repaired": false, "applied": false, "applyRequested": false,
+            "diagnosis": {}, "patch": {}, "runResult": {}, "recovery": []
+          }
+        }
+      ]
+    }
+  },
+  "wires": []
+}
